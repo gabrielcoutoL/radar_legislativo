@@ -1,10 +1,17 @@
-# Python-generated files
+.venv/
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+*.pyc
+.vscode
 
-# Virtual environments
-.venv
+.env
+.env.*
+secrets/
+
+data/
+*.parquet
+*.csv
+*.json
+*.log
+
+.DS_Store
+Thumbs.db
