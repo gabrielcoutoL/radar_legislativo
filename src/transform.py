@@ -358,18 +358,6 @@ class Transformer:
     def run(self) -> dict[str, pd.DataFrame]:
         """
         Executa todas as transformações em sequência.
-
-        Retorna um dicionário:
-            {
-                "dim_deputados":    DataFrame,
-                "dim_partidos":     DataFrame,
-                "fato_proposicoes": DataFrame,
-                "fato_votacoes":    DataFrame,
-                "fato_despesas":    DataFrame,
-            }
-
-        Tabelas com falha são omitidas do dicionário; o erro é logado
-        sem interromper as demais.
         """
         logger.info("=== Iniciando fase de TRANSFORM ===")
 
@@ -386,13 +374,19 @@ class Transformer:
         for nome, fn in etapas:
             try:
                 df = fn()
-                self._salvar_parquet(df, nome)
-                resultado[nome] = df
+                resultado[nome] = df  # garante que o df chega ao Load
                 logger.info(f"[{nome}] ✓  {len(df)} registros.")
-            except FileNotFoundError as e:
-                logger.error(f"[{nome}] Arquivo ausente: {e}")
             except Exception as e:
-                logger.error(f"[{nome}] Falha inesperada: {e}", exc_info=True)
+                logger.error(f"[{nome}] Falha na transformação: {e}", exc_info=True)
+                continue
+
+            try:
+                self._salvar_parquet(df, nome)
+            except Exception as e:
+                logger.warning(
+                    f"[{nome}] Parquet não salvo (pipeline continua normalmente). "
+                    f"Instale pyarrow para habilitar checkpoints: {e}"
+                )
 
         logger.info(
             f"=== TRANSFORM concluído: {len(resultado)}/{len(etapas)} tabelas geradas ==="
