@@ -35,6 +35,8 @@ API da Câmara
 [ IA ]       →  fato_proposicoes.tema      (classificação temática via embeddings)
 ```
 
+![Workflow n8n — canvas completo](img/diagrama.png)
+
 ### Por que três fases com persistência intermediária?
 
 Cada fase grava seu resultado antes de passar para a próxima. Isso garante três propriedades:
