@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.ai import Enricher
 from src.extract import ClientAPI
 from src.load import Loader
 from src.transform import Transformer
@@ -104,6 +105,15 @@ def fase_load(
     Loader().run(tabelas)
 
 
+def fase_ai(logger: logging.Logger) -> None:
+    """
+    Fase 4 — IA: classifica proposições por tema via embeddings OpenAI.
+    Processa apenas proposições com tema IS NULL — idempotente e retomável.
+    """
+    logger.info("=== Fase 4: IA — Classificação temática ===")
+    Enricher().run()
+
+
 def _ler_parquets(logger: logging.Logger) -> dict[str, pd.DataFrame]:
     """
     Lê os parquets gerados pelo Transform e devolve o mesmo formato
@@ -144,14 +154,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--fase",
-        choices=["tudo", "extract", "transform", "load"],
+        choices=["tudo", "extract", "transform", "load", "ai"],
         default="tudo",
         help=(
             "Fase a executar (padrão: tudo):\n"
-            "  tudo       — executa extract → transform → load em sequência\n"
+            "  tudo       — executa extract → transform → load → ai\n"
             "  extract    — apenas coleta da API e persiste JSONLs\n"
             "  transform  — apenas lê JSONLs, valida e salva parquets\n"
-            "  load       — apenas carrega parquets no banco (requer transform anterior)\n"
+            "  load       — apenas carrega parquets no banco\n"
+            "  ai         — apenas classifica proposições por tema\n"
         ),
     )
     args = parser.parse_args()
@@ -164,6 +175,7 @@ def main() -> None:
         _executar_fase("Extract", fase_extract, logger)
         tabelas = _executar_fase("Transform", fase_transform, logger)
         _executar_fase("Load", fase_load, logger, tabelas=tabelas)
+        _executar_fase("IA", fase_ai, logger)
 
     elif args.fase == "extract":
         _executar_fase("Extract", fase_extract, logger)
@@ -173,6 +185,9 @@ def main() -> None:
 
     elif args.fase == "load":
         _executar_fase("Load", fase_load, logger)
+
+    elif args.fase == "ai":
+        _executar_fase("IA", fase_ai, logger)
 
     duracao = time.perf_counter() - inicio_total
     logger.info(f"Pipeline concluído em {duracao:.1f}s.")
