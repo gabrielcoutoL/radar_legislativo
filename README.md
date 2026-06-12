@@ -6,9 +6,12 @@
 2. [Etapa 1 — Extract](#2-etapa-1--extract)
 3. [Etapa 2 — Transform](#3-etapa-2--transform)
 4. [Etapa 3 — Load](#4-etapa-3--load)
-5. [Modelo de dados](#5-modelo-de-dados)
-6. [Orquestração](#6-orquestração)
-7. [Decisões transversais](#7-decisões-transversais)
+5. [Etapa 4 — IA](#5-etapa-4--ia)
+6. [Modelo de dados](#6-modelo-de-dados)
+7. [Orquestração](#7-orquestração)
+8. [Decisões transversais](#8-decisões-transversais)
+9. [Etapa 5 — Automação com n8n](#9-etapa-5--automação-com-n8n)
+10. [Como utilizar](#10-como-utilizar)
 
 ---
 
@@ -20,13 +23,16 @@ O pipeline segue o padrão clássico de **ETL em três fases desacopladas**, cad
 API da Câmara
      │
      ▼
-[ Extract ]  →  data/raw/*.jsonl         (JSON bruto, uma linha por registro)
+[ Extract ]  →  data/raw/*.jsonl           (JSON bruto, uma linha por registro)
      │
      ▼
 [ Transform ] →  data/processed/*.parquet  (DataFrames limpos e tipados)
      │
      ▼
-[ Load ]     →  PostgreSQL / Supabase     (tabelas prontas para consulta)
+[ Load ]     →  PostgreSQL / Supabase      (tabelas prontas para consulta)
+     │
+     ▼
+[ IA ]       →  fato_proposicoes.tema      (classificação temática via embeddings)
 ```
 
 ### Por que três fases com persistência intermediária?
@@ -47,13 +53,14 @@ projeto/
 ├── src/
 │   ├── extract.py        # ClientAPI — coleta da API da Câmara
 │   ├── transform.py      # Transformer — validação e modelagem
-│   └── load.py           # Loader — carga no PostgreSQL
+│   ├── load.py           # Loader — carga no PostgreSQL
+│   └── ai.py             # Enricher — classificação temática via embeddings
 ├── core/
 │   └── exceptions.py     # APIRateLimitError, APIConnectionError
 ├── data/
 │   ├── raw/              # JSONLs brutos (saída do Extract)
 │   └── processed/        # Parquets limpos (saída do Transform)
-└── .env                  # DATABASE_URL (não versionado)
+└── .env                  # DATABASE_URL + OPENAI_API_KEY (não versionado)
 ```
 
 ---
@@ -401,9 +408,151 @@ Após cada `_load_X`, o método `_contar_registros` executa `SELECT COUNT(*) FRO
 
 ---
 
-## 5. Modelo de dados
+## 5. Etapa 4 — IA
 
-### 5.1 Diagrama de tabelas
+**Arquivo:** `src/ai.py`
+**Classe:** `Enricher`
+**Entrada:** `fato_proposicoes` onde `tema IS NULL`
+**Saída:** coluna `tema` populada em `fato_proposicoes`
+
+### 5.1 Abordagem escolhida — Caminho A (embeddings)
+
+Foram avaliados dois caminhos para classificação temática:
+
+**Caminho A — embeddings + similaridade de cosseno:** gera um vetor numérico para cada ementa e calcula a proximidade semântica com vetores de temas pré-definidos. Determinístico, barato e rápido.
+
+**Caminho B — LLM com prompt de classificação:** envia cada ementa para um modelo de linguagem (ex: `gpt-4o-mini`) pedindo que ele classifique o tema. Mais flexível, porém 50-100× mais caro e não determinístico.
+
+O Caminho A foi escolhido por três razões: custo previsível e mínimo, velocidade de processamento em lote e ausência de variabilidade — a mesma ementa sempre gera o mesmo tema.
+
+### 5.2 Modelo de embedding
+
+```
+Modelo:  text-embedding-3-small (OpenAI)
+Dimensões: 1.536
+Custo:   $0.020 / 1 milhão de tokens
+```
+
+O `text-embedding-3-small` foi preferido ao `text-embedding-3-large` (3.072 dimensões, $0.130/1M tokens) porque a tarefa de classificação em 10 temas não se beneficia de representações de alta dimensão — a diferença semântica entre "Saúde" e "Tributário" é grande o suficiente para ser capturada por modelos menores.
+
+### 5.3 Definição dos temas — os "prompts" da camada de IA
+
+Em classificação por embeddings, os "prompts" são os textos que representam cada tema. Usar apenas o nome do tema (ex: `"Tributário"`) produziria embeddings genéricos com pouca discriminação. Cada tema foi definido com uma descrição densa de palavras-chave do domínio:
+
+| Tema | Palavras-chave representativas |
+|---|---|
+| **Saúde** | saúde pública, SUS, medicamentos, hospitais, vacinas, planos de saúde, vigilância sanitária |
+| **Tributário** | impostos, tributos, ICMS, IPI, imposto de renda, alíquota, receita federal, isenção fiscal |
+| **Trabalho** | emprego, CLT, salário mínimo, sindicatos, previdência, FGTS, aposentadoria, licença maternidade |
+| **Tecnologia** | inteligência artificial, LGPD, internet, dados pessoais, cibersegurança, telecomunicações, 5G |
+| **Meio Ambiente** | desmatamento, mudança climática, poluição, biodiversidade, recursos hídricos, agrotóxicos |
+| **Educação** | escolas, universidades, MEC, professores, bolsas, FIES, ProUni, ensino médio, cotas |
+| **Segurança Pública** | polícia, crimes, violência, tráfico, Código Penal, penitenciária, sistema prisional |
+| **Economia** | PIB, inflação, juros, banco central, câmbio, exportação, privatização, concessão |
+| **Direitos Civis** | direitos humanos, discriminação, gênero, raça, acessibilidade, violência doméstica, estatuto |
+| **Infraestrutura** | rodovias, saneamento básico, energia elétrica, habitação, portos, aeroportos, ferrovias |
+
+Os embeddings dos temas são gerados **uma única vez** no início da execução e reutilizados para todas as 161 mil proposições.
+
+### 5.4 Algoritmo de classificação
+
+```python
+# Matriz de temas: shape (10, 1536)
+matriz_temas = np.array(list(embeddings_temas.values()))
+
+# Para cada ementa:
+vetor = np.array(embedding_ementa)           # (1536,)
+similaridades = matriz_temas @ vetor         # (10,) — produto escalar
+tema = nomes_temas[np.argmax(similaridades)] # tema com maior score
+```
+
+Os embeddings do `text-embedding-3-small` são normalizados (norma L2 = 1), portanto o produto escalar é matematicamente equivalente à similaridade de cosseno — sem necessidade de normalização adicional.
+
+### 5.5 Custo real de execução
+
+| Métrica | Valor |
+|---|---|
+| Proposições processadas | 161.882 |
+| Tokens por ementa (após truncamento) | ~120 tokens médios |
+| Total de tokens | ~19,4 milhões |
+| Custo por 1M tokens | $0.020 |
+| **Custo total estimado** | **~$0.39 USD (~R$ 2,20)** |
+| Tokens dos 10 temas | ~500 (desprezível) |
+
+### 5.6 Velocidade de processamento
+
+| Parâmetro | Valor | Motivo |
+|---|---|---|
+| `BATCH_SIZE` | 2.000 | Lote de leitura do banco e classificação |
+| `chunk_size` | 200 | Lote interno do LangChain por chamada à API OpenAI |
+| Chamadas à API por batch | ~10 (2.000 ÷ 200) | Paralelas internamente pelo LangChain |
+| Tempo por batch | ~15s | API OpenAI + UPDATE no Supabase |
+| Total de batches | ~81 (161.882 ÷ 2.000) | |
+| **Tempo total estimado** | **~20-30 minutos** | |
+
+O tempo de 30 min foi observado em execução real com conexão residencial. Em servidor com menor latência para a API OpenAI, a estimativa é 15-20 min.
+
+### 5.7 Problema identificado — HTTP 431 e fallback "Outros"
+
+**Problema:** algumas ementas contêm o texto completo da proposição (milhares de caracteres). Com `BATCH_SIZE=2000`, batches que concentram ementas longas excedem o limite de tamanho de headers HTTP da API OpenAI, gerando erro `431 Request Header Fields Too Large`.
+
+**Solução 1 — truncamento preventivo:** todas as ementas são truncadas a 500 caracteres antes do embedding. Os primeiros 500 caracteres sempre contêm o assunto central da proposição — o restante é linguagem jurídica repetitiva que não altera a classificação temática.
+
+```python
+MAX_CHARS = 500
+ementas_truncadas = [e[:MAX_CHARS] if e else "" for e in ementas]
+```
+
+**Solução 2 — fallback com "Outros":** se um batch ainda falhar após 3 tentativas (timeout de 30s cada), as proposições daquele batch são marcadas com `tema = "Outros"` e o pipeline avança. Sem esse fallback, o pipeline ficaria preso no mesmo batch indefinidamente a cada retomada.
+
+```
+Tratamento em cascade:
+  Falha na API → max_retries=3 → timeout=30s por tentativa
+  Após 3 falhas → except → marca batch como "Outros" → avança
+```
+
+**Reclassificação de "Outros":** proposições marcadas como "Outros" podem ser reclassificadas isoladamente com uma query de reset e nova execução da fase AI:
+
+```sql
+-- Resetar apenas os "Outros" para reclassificação
+UPDATE fato_proposicoes SET tema = NULL WHERE tema = 'Outros';
+```
+
+```bash
+python main.py --fase ai
+```
+
+### 5.8 Idempotência e retomada
+
+O loop de classificação sempre consulta `WHERE tema IS NULL ORDER BY id LIMIT 2000`. Após cada batch ser classificado e salvo, as linhas saem da query naturalmente — sem OFFSET, sem estado externo. Isso garante:
+
+- Interromper com `Ctrl+C` e retomar depois: zero reprocessamento.
+- Rodar a fase AI duas vezes: a segunda execução retorna imediatamente com "Nada a fazer".
+- Falha de conexão no meio: apenas o batch em execução é perdido; os anteriores estão salvos.
+
+### 5.9 LangChain na implementação
+
+O LangChain é usado exclusivamente como cliente para a API de embeddings da OpenAI:
+
+```python
+from langchain_openai import OpenAIEmbeddings
+
+self.embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    api_key=api_key,
+    chunk_size=200,   # lote interno por chamada HTTP
+    timeout=30,       # evita freeze em requests travados
+    max_retries=3,    # retry automático antes de cair no except
+)
+```
+
+O `embed_documents(lista_de_textos)` do LangChain gerencia o chunking interno automaticamente — se a lista tem 2.000 textos e `chunk_size=200`, ele faz 10 chamadas HTTP sequenciais de forma transparente. A lógica de similaridade, batching do banco e atualização são implementadas diretamente com numpy e SQLAlchemy.
+
+---
+
+## 6. Modelo de dados
+
+### 6.1 Diagrama de tabelas
 
 ```
 dim_partidos                    dim_deputados
@@ -449,28 +598,29 @@ ano                   INTEGER
 url_documento         TEXT
 ```
 
-### 5.2 Colunas reservadas para a Etapa 4
+### 6.2 Colunas reservadas para a Etapa 4
 
 `fato_proposicoes.tema` e `fato_proposicoes.resumo_executivo` são criadas nesta etapa já vazias (`NULL`). A Etapa 4 (IA) fará apenas `UPDATE` nessas colunas — sem recriar a tabela, sem reprocessar o pipeline inteiro. Essa decisão de design antecipa o próximo passo e evita uma migração de schema posterior.
 
 ---
 
-## 6. Orquestração
+## 7. Orquestração
 
 **Arquivo:** `main.py`
 
-### 6.1 Modos de execução
+### 7.1 Modos de execução
 
 ```bash
-python main.py               # Executa tudo: extract → transform → load
+python main.py                   # Executa tudo: extract → transform → load → ai
 python main.py --fase extract    # Apenas coleta da API
 python main.py --fase transform  # Apenas transformação (lê data/raw/)
 python main.py --fase load       # Apenas carga (lê data/processed/)
+python main.py --fase ai         # Apenas classificação temática (lê do banco)
 ```
 
-O modo `--fase load` isolado lê os parquets de `data/processed/` sem passar pelo Transform. Isso permite recarregar o banco após uma correção de schema ou uma limpeza manual sem recoletar da API.
+O modo `--fase load` isolado lê os parquets de `data/processed/` sem passar pelo Transform. O modo `--fase ai` lê diretamente do banco — não depende de parquets.
 
-### 6.2 Tratamento de erros entre fases
+### 7.2 Tratamento de erros entre fases
 
 ```python
 def _executar_fase(nome, fn, logger, **kwargs):
@@ -484,7 +634,7 @@ def _executar_fase(nome, fn, logger, **kwargs):
 
 Falhas em uma fase são logadas mas não relançadas no modo `tudo`. Se o Extract falhar parcialmente (ex: timeout na janela 4 de 6), o Transform ainda roda com os dados disponíveis em `data/raw/` e o Load popula o banco com o que existe. O engenheiro analisa os logs e roda `--fase extract` para completar a extração.
 
-### 6.3 Timing por fase
+### 7.3 Timing por fase
 
 Cada fase é cronometrada com `time.perf_counter()`:
 
@@ -492,21 +642,24 @@ Cada fase é cronometrada com `time.perf_counter()`:
 18:34:59 [INFO] Pipeline Bússola Pública iniciado — fase: 'tudo'
 18:34:59 [INFO] === Fase 1: EXTRACT ===
 ...
-18:38:12 [INFO] [Extract] concluído em 193.4s.
+18:38:12 [INFO] [Extract] concluído em 2984.5s.
 18:38:12 [INFO] === Fase 2: TRANSFORM ===
 ...
-18:38:15 [INFO] [Transform] concluído em 3.1s.
+18:38:15 [INFO] [Transform] concluído em 12.5s.
 18:38:15 [INFO] === Fase 3: LOAD ===
 ...
 18:38:47 [INFO] [Load] concluído em 31.8s.
-18:38:47 [INFO] Pipeline concluído em 228.3s.
+18:38:47 [INFO] === Fase 4: IA ===
+...
+19:08:51 [INFO] [IA] concluído em 1804.2s.
+19:08:51 [INFO] Pipeline concluído em 4833.0s.
 ```
 
 ---
 
-## 7. Decisões transversais
+## 8. Decisões transversais
 
-### 7.1 Logging estruturado
+### 8.1 Logging estruturado
 
 Todo o pipeline usa o módulo `logging` padrão do Python com o formato:
 ```
@@ -515,11 +668,11 @@ HH:MM:SS [NIVEL] mensagem
 
 Não foi usada nenhuma biblioteca de logging estruturado (structlog, loguru) para manter zero dependências externas além das funcionais. O padrão `[entidade] mensagem` nos logs permite filtrar por endpoint ou tabela com `grep` em produção.
 
-### 7.2 Sem frameworks ETL externos
+### 8.2 Sem frameworks ETL externos
 
 O pipeline não usa Airflow, Luigi, Prefect ou similar. A decisão é intencional para um projeto de portfólio: frameworks de orquestração adicionam complexidade de infraestrutura (servidores, bancos de metadados, UIs) que ofusca o código real. A orquestração via `main.py` com `argparse` é suficiente para a escala atual e compreensível por qualquer recrutador que abrir o repositório.
 
-### 7.3 Variáveis de ambiente via `.env`
+### 8.3 Variáveis de ambiente via `.env`
 
 Credenciais nunca são hardcoded. O `python-dotenv` carrega o `.env` no início do `load.py` com `load_dotenv()`. O arquivo `.env` deve estar no `.gitignore`:
 
@@ -531,6 +684,291 @@ data/processed/
 
 `data/raw/` e `data/processed/` também devem ser ignorados — são artefatos gerados pelo pipeline, não código-fonte.
 
-### 7.4 Compatibilidade com o n8n (Etapa 5)
+### 8.4 Compatibilidade com o n8n (Etapa 5)
 
-O n8n tem integração nativa com PostgreSQL. Os workflows da Etapa 5 podem conectar diretamente ao Supabase e executar queries sobre as tabelas criadas aqui. A estrutura de nomes (`dim_*`, `fato_*`) e a presença das colunas `tema` e `resumo_executivo` já preparadas facilitam a construção de alertas e relatórios automatizados sem alterações de schema.
+O n8n tem integração nativa com PostgreSQL. Os workflows da Etapa 5 podem conectar diretamente ao Supabase e executar queries sobre as tabelas criadas aqui. A coluna `tema` — populada pela camada de IA — permite queries diretas como:
+
+```sql
+-- Proposições de Tecnologia apresentadas nos últimos 30 dias
+SELECT sigla_tipo, numero, ano, ementa, tema
+FROM fato_proposicoes
+WHERE tema = 'Tecnologia'
+  AND data_apresentacao >= NOW() - INTERVAL '30 days'
+ORDER BY data_apresentacao DESC;
+```
+
+Essa query é a base para alertas automáticos no n8n: quando uma nova proposição de tema crítico é classificada, um workflow pode disparar email ou mensagem no Telegram para o cliente da Bússola Pública sem intervenção humana.
+
+---
+
+## 9. Etapa 5 — Automação com n8n
+
+**Ferramenta:** n8n (self-hosted via Docker)
+**Workflow:** relatório executivo semanal automatizado
+**Saída:** mensagem no Telegram toda segunda-feira às 06h
+
+### 9.1 Arquitetura da automação
+
+O insight central desta etapa é que **o n8n não roda o pipeline pesado**. O pipeline completo (extract de ~2h + IA de ~30min) é executado uma única vez localmente para popular o histórico. O n8n cuida apenas da camada de inteligência recorrente: consultar o banco já populado, gerar um relatório executivo com LLM e entregá-lo automaticamente.
+
+```
+┌──────────────────────────────────────────────────────┐
+│  CARGA HISTÓRICA (uma vez, local)                      │
+│  python main.py → popula ~161k proposições no Supabase │
+└──────────────────────────────────────────────────────┘
+                        │
+                        ▼
+              Supabase (banco populado)
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────┐
+│  RELATÓRIO SEMANAL (n8n, toda segunda 06h)             │
+│  Query agregada → LLM → Telegram                       │
+│  Roda em segundos                                       │
+└──────────────────────────────────────────────────────┘
+```
+
+Essa separação espelha o pitch do produto: a inteligência legislativa não precisa reprocessar todo o histórico a cada ciclo — precisa destilar o que é relevante e entregar pronto.
+
+### 9.2 Subindo o n8n via docker-compose
+
+O n8n roda localmente em container, eliminando o custo do n8n Cloud ou de uma VPS. Arquivo `docker-compose.yml` na raiz do projeto:
+
+```yaml
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_SECURE_COOKIE=false
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+      - TZ=America/Sao_Paulo
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
+```
+
+Subir o serviço:
+
+```bash
+docker compose up -d
+```
+
+A interface fica disponível em `http://localhost:5678`. O volume `n8n_data` persiste os workflows e credenciais entre reinícios do container.
+
+### 9.3 Estrutura do workflow
+
+O workflow encadeia seis nodes:
+
+```
+[Schedule Trigger]  toda segunda, 06h
+        │
+[Postgres]          query agregada no Supabase
+        │
+[Code]              monta payload + calcula crescimento + prompt
+        │
+[HTTP Request]      OpenAI gpt-4o-mini gera o relatório
+        │
+[Code]              extrai texto e formata para Telegram
+        │
+[Telegram]          envia a mensagem
+```
+
+### 9.4 Query de agregação
+
+O node Postgres roda uma única query que consolida três indicadores em um objeto JSON, usando subqueries para evitar múltiplas idas ao banco:
+
+```sql
+SELECT
+  (SELECT json_agg(t) FROM (
+    SELECT tema,
+      COUNT(*) FILTER (WHERE data_apresentacao >= NOW() - INTERVAL '7 days') AS esta_semana,
+      COUNT(*) FILTER (WHERE data_apresentacao >= NOW() - INTERVAL '14 days'
+                       AND data_apresentacao < NOW() - INTERVAL '7 days') AS semana_passada
+    FROM fato_proposicoes
+    WHERE tema IS NOT NULL
+    GROUP BY tema
+    ORDER BY esta_semana DESC
+  ) t) AS por_tema,
+  (SELECT row_to_json(v) FROM (
+    SELECT
+      COUNT(*) AS total,
+      COUNT(*) FILTER (WHERE aprovacao = 1) AS aprovadas,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE aprovacao = 1) / NULLIF(COUNT(*), 0), 1) AS taxa
+    FROM fato_votacoes
+    WHERE data >= NOW() - INTERVAL '7 days'
+  ) v) AS votacoes;
+```
+
+A query retorna dois campos: `por_tema` (volume de proposições por tema na semana atual e na anterior) e `votacoes` (total, aprovadas e taxa de aprovação da semana).
+
+### 9.5 Cálculo de tendência no node Code
+
+O primeiro node Code processa o resultado da query, calcula a variação percentual de cada tema em relação à semana anterior e monta o payload enviado ao LLM:
+
+```javascript
+const dados = $input.first().json;
+const porTema = dados.por_tema || [];
+const votacoes = dados.votacoes || { total: 0, aprovadas: 0, taxa: 0 };
+
+const comCrescimento = porTema.map(t => {
+  const atual = Number(t.esta_semana) || 0;
+  const anterior = Number(t.semana_passada) || 0;
+  const variacao = anterior === 0
+    ? (atual > 0 ? 100 : 0)
+    : Math.round(((atual - anterior) / anterior) * 100);
+  return { tema: t.tema, atual, anterior, variacao };
+});
+
+const hoje = new Date();
+const seteDiasAtras = new Date(hoje);
+seteDiasAtras.setDate(hoje.getDate() - 7);
+const fmt = d => d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+const periodo = `${fmt(seteDiasAtras)} a ${fmt(hoje)}`;
+
+const payload = { periodo, por_tema: comCrescimento, votacoes };
+```
+
+O cálculo de variação trata o caso de divisão por zero: quando não houve proposições do tema na semana anterior, atribui 100% de crescimento se houver alguma na semana atual.
+
+### 9.6 Prompt para o LLM
+
+O resumo executivo (equivalente ao Caminho B da Etapa 4, porém aplicado sobre dados agregados em vez de proposições individuais) é gerado pelo `gpt-4o-mini` com o seguinte prompt:
+
+```
+Você é analista de inteligência legislativa da consultoria Bússola Pública.
+Com base nos dados abaixo, escreva um relatório executivo curto (máximo 8 linhas)
+para clientes corporativos, em português, destacando:
+- o tema com maior volume na semana
+- o tema com maior crescimento percentual em relação à semana anterior
+- a taxa de aprovação das votações da semana
+Use tom profissional e direto. NÃO invente dados além dos fornecidos.
+
+Dados: {payload JSON}
+```
+
+Duas decisões de prompt importantes:
+
+A instrução **"NÃO invente dados além dos fornecidos"** é essencial num produto de inteligência — uma estatística alucinada pelo modelo destruiria a credibilidade do relatório vendido a clientes corporativos.
+
+O parâmetro **`temperature: 0.3`** mantém o texto factual e consistente entre execuções, evitando floreios que comprometeriam o tom executivo.
+
+### 9.7 Por que resumo agregado em vez do Caminho B literal
+
+O Caminho B original propõe resumir cada proposição individualmente em 3 linhas. Para 161k proposições isso não escala como produto — ninguém lê 161k resumos. O **digest agregado semanal** é o que uma consultoria de inteligência legislativa de fato entrega: destila o volume total em um panorama acionável de poucas linhas, destacando tendências (qual tema cresceu) e indicadores (taxa de aprovação). O LLM continua cumprindo o papel do Caminho B — transformar dados em linguagem executiva — mas sobre o agregado, não o item isolado.
+
+### 9.8 Observação técnica — SSL no container
+
+A conexão do n8n ao Supabase usa SSL desabilitado devido a uma incompatibilidade de validação de certificado no container Docker em ambiente Windows. Em produção, isso seria resolvido montando os certificados raiz no container ou usando `sslmode=require` (que criptografa sem validar a autoridade certificadora), comportamento equivalente ao do pipeline Python no `load.py`. Como o n8n roda localmente e a conexão é de leitura de dados públicos, a decisão não representa risco para este contexto.
+
+### 9.9 Entregável
+
+O workflow é exportado como JSON (menu do workflow → Download) e versionado em `n8n/workflow_relatorio_semanal.json` no repositório.
+
+### 9.10 Prints da Execução
+
+
+![Workflow n8n — canvas completo](img\workflow.png)
+
+
+![Relatório recebido no Telegram](img\telegram.png)
+
+---
+
+## 10. Como utilizar
+
+### 10.1 Pré-requisitos
+
+- Python 3.11+ (testado em 3.13)
+- Conta no Supabase (plano gratuito) com um projeto criado
+- Chave de API da OpenAI com créditos (~$5 são suficientes)
+- Docker e Docker Compose (apenas para a Etapa 5 / n8n)
+
+### 10.2 Instalação
+
+```bash
+# Clonar o repositório
+git clone <url-do-repo>
+cd radar_legislativo
+
+# Criar e ativar o ambiente virtual
+python -m venv .venv
+# Windows
+.venv\Scripts\Activate.ps1
+# Linux / macOS
+source .venv/bin/activate
+
+# Instalar dependências
+pip install -r requirements.txt
+```
+
+### 10.3 Configuração do `.env`
+
+Crie um arquivo `.env` na raiz do projeto com as duas variáveis:
+
+```bash
+# Connection string do Supabase — use o Session Pooler (IPv4)
+DATABASE_URL=postgresql://postgres.SEU_REF:SUA_SENHA@aws-0-REGIAO.pooler.supabase.com:5432/postgres?sslmode=require
+
+# Chave da OpenAI para a camada de IA
+OPENAI_API_KEY=sk-proj-...
+```
+
+A connection string é obtida no painel do Supabase em **Connect → Session pooler**. Não use a conexão direta (porta 5432 sem pooler), que é IPv6-only e incompatível com a maioria das redes residenciais.
+
+### 10.4 Executando o pipeline
+
+O pipeline é controlado pela flag `--fase` no `main.py`:
+
+```bash
+# Pipeline completo: extract → transform → load → ai
+python main.py
+
+# Cada fase isoladamente
+python main.py --fase extract     # coleta da API → data/raw/*.jsonl
+python main.py --fase transform   # validação → data/processed/*.parquet
+python main.py --fase load        # carga no Supabase
+python main.py --fase ai          # classificação temática por embeddings
+```
+
+### 10.5 Ordem recomendada na primeira execução
+
+A primeira execução completa é demorada (Extract ~2h, IA ~30min). Para evitar reprocessar tudo em caso de falha, rode fase a fase e valide cada uma antes de seguir:
+
+```bash
+# 1. Extrair (mais demorado — pode rodar e ir fazer outra coisa)
+python main.py --fase extract
+
+# 2. Transformar (rápido — gera os parquets)
+python main.py --fase transform
+
+# 3. Carregar no banco (verifique no Supabase Table Editor se as tabelas foram criadas)
+python main.py --fase load
+
+# 4. Classificar por tema (consome créditos OpenAI — custo ~$0.40)
+python main.py --fase ai
+```
+
+Cada fase é idempotente e retomável: se o Extract cair na metade, rode novamente e ele recomeça do zero (recriando os arquivos); se a IA cair, ela retoma de onde parou via `WHERE tema IS NULL`.
+
+### 10.6 Dicas de recuperação
+
+Se a fase de IA travar por timeout ou erro de rede, basta rodar `python main.py --fase ai` novamente — as proposições já classificadas são puladas automaticamente. Para reclassificar proposições marcadas com o fallback "Outros":
+
+```sql
+UPDATE fato_proposicoes SET tema = NULL WHERE tema = 'Outros';
+```
+
+E rode a fase AI mais uma vez.
+
+### 10.7 Subindo a automação (Etapa 5)
+
+```bash
+docker compose up -d
+```
+
+Acesse `http://localhost:5678`, importe o workflow de `n8n/workflow_relatorio_semanal.json`, configure as credenciais (Postgres do Supabase, Header Auth da OpenAI, token do Telegram) e ative o toggle do workflow. O relatório passará a ser enviado automaticamente toda segunda às 06h.

@@ -1,0 +1,196 @@
+{
+  "name": "Relatorio Semanal",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "cc878b70-c0ca-411b-b33f-001234cfd6a6",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  (SELECT json_agg(t) FROM (\n    SELECT tema,\n      COUNT(*) FILTER (WHERE data_apresentacao >= NOW() - INTERVAL '7 days') AS esta_semana,\n      COUNT(*) FILTER (WHERE data_apresentacao >= NOW() - INTERVAL '14 days'\n                       AND data_apresentacao < NOW() - INTERVAL '7 days') AS semana_passada\n    FROM fato_proposicoes\n    WHERE tema IS NOT NULL\n    GROUP BY tema\n    ORDER BY esta_semana DESC\n  ) t) AS por_tema,\n  (SELECT row_to_json(v) FROM (\n    SELECT\n      COUNT(*) AS total,\n      COUNT(*) FILTER (WHERE aprovacao = 1) AS aprovadas,\n      ROUND(100.0 * COUNT(*) FILTER (WHERE aprovacao = 1) / NULLIF(COUNT(*), 0), 1) AS taxa\n    FROM fato_votacoes\n    WHERE data >= NOW() - INTERVAL '7 days'\n  ) v) AS votacoes;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "f7177491-1ce3-41f2-8f73-34083479d120",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "im4F1WtXtLCaugZJ",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const dados = $input.first().json;\n\nconst porTema = dados.por_tema || [];\nconst votacoes = dados.votacoes || { total: 0, aprovadas: 0, taxa: 0 };\n\n// Calcular crescimento por tema\nconst comCrescimento = porTema.map(t => {\n  const atual = Number(t.esta_semana) || 0;\n  const anterior = Number(t.semana_passada) || 0;\n  const variacao = anterior === 0\n    ? (atual > 0 ? 100 : 0)\n    : Math.round(((atual - anterior) / anterior) * 100);\n  return { tema: t.tema, atual, anterior, variacao };\n});\n\n// Período da semana\nconst hoje = new Date();\nconst seteDiasAtras = new Date(hoje);\nseteDiasAtras.setDate(hoje.getDate() - 7);\nconst fmt = d => d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });\nconst periodo = `${fmt(seteDiasAtras)} a ${fmt(hoje)}`;\n\n// Payload para o LLM\nconst payload = {\n  periodo,\n  por_tema: comCrescimento,\n  votacoes,\n};\n\nconst prompt = `Você é analista de inteligência legislativa da consultoria Bússola Pública.\nCom base nos dados abaixo, escreva um relatório executivo curto (máximo 8 linhas) para clientes corporativos, em português, destacando:\n- o tema com maior volume na semana\n- o tema com maior crescimento percentual em relação à semana anterior\n- a taxa de aprovação das votações da semana\nUse tom profissional e direto. NÃO invente dados além dos fornecidos.\n\nDados: ${JSON.stringify(payload)}`;\n\nreturn [{ json: { prompt, payload } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        0
+      ],
+      "id": "602e4724-41ee-475f-b0aa-d73beb9ae3a8",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o-mini\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": {{ JSON.stringify($json.prompt) }} }\n  ],\n  \"temperature\": 0.3\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        624,
+        0
+      ],
+      "id": "f977f861-4718-4446-858e-e675a645c96c",
+      "name": "HTTP Request",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "x1LhG6XaKZyhxFxX",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const resposta = $input.first().json;\nconst texto = resposta.choices?.[0]?.message?.content || \"Relatório indisponível.\";\n\nconst mensagem = `📊 *Bússola Pública — Relatório Semanal*\\n\\n${texto}`;\n\nreturn [{ json: { mensagem } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        0
+      ],
+      "id": "936bd763-dfdd-41da-bcec-8d8823a13cca",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "chatId": "1980856478",
+        "text": "={{ $json.mensagem }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        0
+      ],
+      "id": "41fa9bfa-4328-4af3-a0ed-13c750170e72",
+      "name": "Send a text message",
+      "webhookId": "bddc9df9-10b4-4852-97a9-5fd3e96cdba8",
+      "credentials": {
+        "telegramApi": {
+          "id": "ypXmK2CNT3FgX4XB",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "b0403299-c776-4f6d-8aa3-4b3a6de23fff",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "10b47f0163a83c4c43be98ccdeba55a2e22dc859955711ee83c457f93852a1dd"
+  },
+  "nodeGroups": [],
+  "id": "rXNKlGH9lwDXHuxX",
+  "tags": []
+}
