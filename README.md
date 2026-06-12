@@ -872,10 +872,10 @@ O workflow é exportado como JSON (menu do workflow → Download) e versionado e
 ### 9.10 Prints da Execução
 
 
-![Workflow n8n — canvas completo](img\workflow.png)
+![Workflow n8n — canvas completo](img/workflow.png)
 
 
-![Relatório recebido no Telegram](img\telegram.png)
+![Relatório recebido no Telegram](img/telegram.png)
 
 ---
 
