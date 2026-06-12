@@ -324,7 +324,7 @@ Após cada transformação bem-sucedida, o DataFrame é salvo em `data/processed
 **Classe:** `Loader`  
 **Entrada:** dicionário `{nome: DataFrame}` retornado pelo Transform  
 **Saída:** tabelas populadas no PostgreSQL (Supabase)  
-**URL PÚBLICA:** postgresql://avaliador:senha_publica_readonly@aws-0-REGIAO.pooler.supabase.com:5432/postgres
+**URL PÚBLICA:** postgresql://avaliador.snbccekiunnkpluhmugs:senha_publica_readonly@aws-1-us-east-2.pooler.supabase.com:5432/postgres
 
 ### 4.1 Conexão com o banco
 
