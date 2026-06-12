@@ -10,7 +10,6 @@ secrets/
 data/
 *.parquet
 *.csv
-*.json
 *.log
 
 .DS_Store
